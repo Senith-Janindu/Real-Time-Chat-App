@@ -36,7 +36,8 @@ const messageSchema = new mongoose.Schema({
   sender: { type: String, required: true },
   recipient: { type: String, required: true },
   message: { type: String, required: true },
-  timestamp: { type: Date, default: Date.now }
+  timestamp: { type: Date, default: Date.now },
+  edited: { type: Boolean, default: false } // Add this line
 });
 
 const userSchema = new mongoose.Schema({
@@ -97,24 +98,64 @@ wss.on('connection', (ws) => {
     // Handle chat messages
     if (messageData.sender && messageData.recipient && messageData.message) {
       try {
-        const newMessage = new Message({
+        // Create and save the new message
+        const newMessage = await new Message({
           sender: messageData.sender,
           recipient: messageData.recipient,
           message: messageData.message
-        });
-        await newMessage.save();
+        }).save();
 
+        // Log the message ID to confirm that it exists
+        console.log('New message saved with ID:', newMessage._id);
+
+        // Send the message to the recipient's WebSocket client
         const recipientWs = users.get(messageData.recipient);
         if (recipientWs && recipientWs.readyState === WebSocket.OPEN) {
-          recipientWs.send(JSON.stringify(newMessage));
+          recipientWs.send(JSON.stringify(newMessage)); // Send the full message object with _id
         } else {
           ws.send(JSON.stringify({ type: 'info', message: `Recipient ${messageData.recipient} is offline` }));
+        }
+
+        // Send the message back to the sender's WebSocket client as well
+        const senderWs = users.get(messageData.sender);
+        if (senderWs && senderWs.readyState === WebSocket.OPEN) {
+          senderWs.send(JSON.stringify(newMessage)); // Send the full message object with _id
         }
       } catch (err) {
         console.error('Error saving or sending message:', err);
         ws.send(JSON.stringify({ type: 'error', message: 'Error processing message' }));
       }
     }
+
+    // Handle edit messages
+    if (messageData.type === 'edit' && messageData.messageId) {
+      try {
+        const editedMessage = await Message.findByIdAndUpdate(
+          messageData.messageId,
+          { message: messageData.newMessage, edited: true },
+          { new: true } // This ensures the updated document is returned
+        );
+
+        if (editedMessage) {
+          console.log('Edited message:', editedMessage); // Debug to ensure _id is present
+
+          const recipientWs = users.get(messageData.recipient);
+          if (recipientWs && recipientWs.readyState === WebSocket.OPEN) {
+            recipientWs.send(JSON.stringify({ type: 'edit', message: editedMessage }));
+          }
+
+          const senderWs = users.get(messageData.sender);
+          if (senderWs && senderWs.readyState === WebSocket.OPEN) {
+            senderWs.send(JSON.stringify({ type: 'edit', message: editedMessage }));
+          }
+        }
+      } catch (err) {
+        console.error('Error editing message:', err);
+        ws.send(JSON.stringify({ type: 'error', message: 'Error editing message' }));
+      }
+      return;
+    }
+
   });
 
   ws.on('close', () => {
