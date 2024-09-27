@@ -16,78 +16,99 @@ mongoose.connect(mongoURI, { useNewUrlParser: true, useUnifiedTopology: true })
   .then(() => console.log('MongoDB connected'))
   .catch(err => console.log('Error connecting to MongoDB:', err));
 
-// Define a Message schema
+// Define a Message schema for one-to-one chat
 const messageSchema = new mongoose.Schema({
-  username: { type: String, required: true },
+  sender: { type: String, required: true },
+  recipient: { type: String, required: true },
   message: { type: String, required: true },
   timestamp: { type: Date, default: Date.now }
 });
 
-const Message = mongoose.model('Message', messageSchema);
+const userSchema = new mongoose.Schema({
+  username: { type: String, required: true, unique: true },
+  registeredAt: { type: Date, default: Date.now }
+});
 
-// Serve static files (for frontend)
-app.use(express.static('public'));
+const Message = mongoose.model('Message', messageSchema);
+const User = mongoose.model('User', userSchema);
+
+// Map to store connected users and their WebSocket connections
+const users = new Map();
 
 // WebSocket connection event
-wss.on('connection', async (ws) => {
+wss.on('connection', (ws) => {
   console.log('New client connected');
 
-  try {
-    // Fetch and send the chat history to the newly connected client
-    const messages = await Message.find().sort({ timestamp: 1 }).limit(100);
-    ws.send(JSON.stringify({ type: 'history', data: messages }));
-  } catch (err) {
-    console.error('Error fetching messages:', err);
-  }
-
-  // Handle incoming messages from the client
+  // When the client sends a message, handle the registration or chat message
   ws.on('message', async (data) => {
     const messageData = JSON.parse(data);
 
-    // Check if the message is a typing indicator
-    if (messageData.type === 'typing') {
-      // Broadcast typing indicator to all clients except the one who is typing
-      wss.clients.forEach((client) => {
-        if (client !== ws && client.readyState === WebSocket.OPEN) {
-          client.send(JSON.stringify({ type: 'typing', username: messageData.username }));
+    // Handle user registration
+    if (messageData.type === 'register') {
+      const { username } = messageData;
+      
+      try {
+        // Check if the user already exists in the database
+        let user = await User.findOne({ username });
+        
+        if (!user) {
+          // If the user does not exist, create a new user
+          user = new User({ username });
+          await user.save();
+          console.log(`User ${username} registered and saved to the database`);
+        } else {
+          console.log(`User ${username} already exists in the database`);
         }
-      });
-    } else {
-      // Validate incoming message
-      if (!messageData.username || !messageData.message) {
-        console.error('Invalid message data');
-        return;
+
+        // Register the user with their WebSocket
+        users.set(username, ws); // Associate the WebSocket with the username
+        console.log(`${username} connected`);
+
+      } catch (err) {
+        console.error(`Error registering user ${username}:`, err);
+        ws.send(JSON.stringify({ type: 'error', message: 'Error registering user' }));
       }
 
-      // Save the actual message to MongoDB
+      return; // Exit the function after registration
+    }
+
+    // Handle sending a message from one user to another
+    if (messageData.sender && messageData.recipient && messageData.message) {
       try {
+        // Save the message to MongoDB
         const newMessage = new Message({
-          username: messageData.username,
+          sender: messageData.sender,
+          recipient: messageData.recipient,
           message: messageData.message
         });
         await newMessage.save();
         console.log('Message saved:', newMessage);
-      } catch (err) {
-        console.error('Error saving message:', err);
-        return;
-      }
 
-      // Broadcast the message to all connected clients
-      wss.clients.forEach((client) => {
-        if (client.readyState === WebSocket.OPEN) {
-          client.send(JSON.stringify({
-            username: messageData.username,
-            message: messageData.message,
-            timestamp: new Date()  // Broadcast with the timestamp
-          }));
+        // Send the message to the recipient if they are online
+        const recipientWs = users.get(messageData.recipient);
+        if (recipientWs && recipientWs.readyState === WebSocket.OPEN) {
+          recipientWs.send(JSON.stringify(newMessage)); // Send message to the recipient
+        } else {
+          console.log(`Recipient ${messageData.recipient} is offline`);
+          ws.send(JSON.stringify({ type: 'info', message: `Recipient ${messageData.recipient} is offline` }));
         }
-      });
+      } catch (err) {
+        console.error('Error saving or sending message:', err);
+        ws.send(JSON.stringify({ type: 'error', message: 'Error processing message' }));
+      }
     }
   });
 
   // Handle client disconnection
   ws.on('close', () => {
-    console.log('Client disconnected');
+    // Remove the user from the users map when they disconnect
+    for (const [username, connection] of users.entries()) {
+      if (connection === ws) {
+        users.delete(username);
+        console.log(`${username} disconnected`);
+        break;
+      }
+    }
   });
 });
 
